@@ -1,20 +1,38 @@
 """
 Marketing Mix Media Optimizer
 ==============================
-Bayesian Marketing Mix Model with adstock transformations and LLM-powered
-insight generation for marketing spend optimisation.
+Bayesian Marketing Mix Model (PyMC) with adstock and Hill saturation, posterior
+credible intervals for attribution and ROI, and a budget optimiser that works on
+the posterior.
 
-Author: Portfolio Project
+Model, per week t and channel c (spend scaled by the channel's maximum, revenue
+scaled by its mean):
+
+    adstock[t, c]   = sum_l  w[c, l] * spend[t - l, c],   w[c, l] ∝ decay[c] ** l
+    saturated[t, c] = adstock^alpha[c] / (adstock^alpha[c] + gamma[c]^alpha[c])   (zero when adstock is zero)
+    mu[t]           = intercept + sum_c beta[c] * saturated[t, c] + controls[t] · control_coef
+    revenue[t]      ~ Normal(mu[t], sigma)
+
+Priors:
+
+    decay[c]      ~ Beta(3, 3)         carryover rate
+    alpha[c]      ~ Gamma(3, 3)        Hill shape (mean 1)
+    gamma[c]      ~ Beta(2, 2)         half-saturation point, as a share of maximum spend
+    beta[c]       ~ HalfNormal(0.5)    channel effect; positive by construction
+    intercept     ~ Normal(0.5, 0.5)
+    control_coef  ~ Normal(0, 0.5)
+    sigma         ~ HalfNormal(0.2)
 """
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import expit
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_percentage_error
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.metrics import mean_absolute_percentage_error, r2_score
+
+MAX_LAG = 12          # weeks of carryover kept in the adstock window
+ADSTOCK_FLOOR = 1e-9  # keeps log(adstock) finite; weeks with no adstocked spend contribute exactly zero
+POSTERIOR_KEYS = ("intercept", "beta", "decay", "alpha", "gamma", "control_coef", "sigma")
 
 
 # ── Adstock & Saturation Transforms ──────────────────────────────────────────
@@ -23,7 +41,6 @@ def adstock_transform(x: np.ndarray, decay: float) -> np.ndarray:
     """
     Apply geometric adstock transformation to capture carryover effects.
 
-    Adstock models the lagged/accumulated effect of advertising spend:
     adstock[t] = spend[t] + decay * adstock[t-1]
 
     Args:
@@ -44,9 +61,6 @@ def hill_saturation(x: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
     """
     Apply Hill (S-curve) saturation transformation.
 
-    Models diminishing returns: as spend increases, incremental
-    return decreases. Half-saturation point at gamma.
-
     Args:
         x: Adstocked spend values
         alpha: Shape parameter (steepness of the curve)
@@ -59,241 +73,457 @@ def hill_saturation(x: np.ndarray, alpha: float, gamma: float) -> np.ndarray:
     return x_safe ** alpha / (x_safe ** alpha + gamma ** alpha)
 
 
+def lag_matrix(x: np.ndarray, max_lag: int = MAX_LAG) -> np.ndarray:
+    """
+    Stack lagged copies of a spend series: column l holds spend from l weeks earlier.
+
+    Weeks before the start of the series count as zero spend.
+
+    Returns:
+        Array of shape (len(x), max_lag)
+    """
+    x = np.asarray(x, dtype=float)
+    lagged = np.zeros((len(x), max_lag))
+    for lag in range(min(max_lag, len(x))):
+        lagged[lag:, lag] = x[: len(x) - lag]
+    return lagged
+
+
+def to_records(frame: pd.DataFrame) -> list[dict]:
+    """DataFrame → list of dicts with NaN replaced by None, so the result is valid JSON."""
+    return [
+        {key: (None if isinstance(value, float) and np.isnan(value) else value) for key, value in row.items()}
+        for row in frame.to_dict(orient="records")
+    ]
+
+
+def gelman_rubin(chains: np.ndarray) -> float:
+    """
+    Largest R-hat across the parameters in `chains`, shape (n_chains, n_draws, ...).
+
+    Values close to 1 mean the chains agree. Returns NaN with fewer than two chains.
+    """
+    chains = np.asarray(chains, dtype=float)
+    n_chains, n_draws = chains.shape[:2]
+    if n_chains < 2 or n_draws < 2:
+        return float("nan")
+    within = chains.var(axis=1, ddof=1).mean(axis=0)
+    between = chains.mean(axis=1).var(axis=0, ddof=1)
+    pooled = (n_draws - 1) / n_draws * within + between
+    return float(np.max(np.sqrt(pooled / np.maximum(within, 1e-300))))
+
+
 # ── Marketing Mix Model ───────────────────────────────────────────────────────
 
 class MarketingMixModel:
     """
-    Bayesian-inspired Marketing Mix Model (MMM) with:
-    - Adstock (carryover) transformations per media channel
-    - Hill saturation (diminishing returns) per channel
+    Bayesian Marketing Mix Model (MMM) with:
+    - Adstock (carryover) and Hill saturation estimated per channel
     - Trend and seasonality controls
-    - Budget allocation optimiser
+    - Posterior credible intervals for attribution and ROI
+    - Budget allocation optimiser over the posterior
     - LLM-ready insight extraction
     """
 
-    def __init__(self, channels: list[str], target: str = "revenue"):
+    def __init__(
+        self,
+        channels: list[str],
+        target: str = "revenue",
+        controls: list[str] | None = None,
+        max_lag: int = MAX_LAG,
+    ):
         self.channels = channels
         self.target = target
-        self.params: dict = {}
-        self.scaler = StandardScaler()
-        self.baseline_scaler = StandardScaler()
+        self.controls = controls
+        self.max_lag = max_lag
+        self.posterior_: dict = {}
+        self.diagnostics_: dict = {}
+        self.idata_ = None
         self.is_fitted = False
 
-    # ── Feature Engineering ───────────────────────────────────────────────────
+    # ── Scaling & Feature Engineering ─────────────────────────────────────────
 
-    def _build_features(
-        self,
-        df: pd.DataFrame,
-        adstock_decays: dict,
-        hill_alphas: dict,
-        hill_gammas: dict,
-    ) -> np.ndarray:
-        """Apply adstock + saturation transforms to all channels."""
-        features = []
-        for ch in self.channels:
-            spend = df[ch].values.astype(float)
-            decay = adstock_decays.get(ch, 0.5)
-            alpha = hill_alphas.get(ch, 1.0)
-            gamma = hill_gammas.get(ch, np.mean(spend))
+    def _raw_controls(self, df: pd.DataFrame) -> np.ndarray:
+        columns = [df[name].values.astype(float) for name in self.controls_]
+        if self.interaction_:
+            columns.append(df["trend"].values.astype(float) * df["seasonality"].values.astype(float))
+        if not columns:
+            return np.zeros((len(df), 0))
+        return np.column_stack(columns)
 
-            transformed = hill_saturation(adstock_transform(spend, decay), alpha, gamma)
-            features.append(transformed)
+    def _prepare(self, df: pd.DataFrame) -> None:
+        """Learn the scaling constants from the training data."""
+        if self.controls is None:
+            self.controls_ = [name for name in ("trend", "seasonality") if name in df.columns]
+        else:
+            self.controls_ = list(self.controls)
+        # Baseline revenue often scales with trend × seasonality, so include the product.
+        self.interaction_ = "trend" in self.controls_ and "seasonality" in self.controls_
+        self.control_names_ = self.controls_ + (["trend_x_seasonality"] if self.interaction_ else [])
 
-        # Add trend + seasonality controls if present
-        if "trend" in df.columns:
-            features.append(df["trend"].values.astype(float))
-        if "seasonality" in df.columns:
-            features.append(df["seasonality"].values.astype(float))
+        self._spend_scale = np.array([max(float(df[ch].max()), 1.0) for ch in self.channels])
+        raw = self._raw_controls(df)
+        self._control_mean = raw.mean(axis=0)
+        std = raw.std(axis=0)
+        self._control_std = np.where(std == 0, 1.0, std)
+        self._y_scale = float(df[self.target].mean())
 
-        return np.column_stack(features)
+    def _spend_lags(self, spend: np.ndarray) -> np.ndarray:
+        """(T, C) spend in currency → (T, C, L) scaled lag tensor."""
+        scaled = spend / self._spend_scale
+        return np.stack([lag_matrix(scaled[:, c], self.max_lag) for c in range(len(self.channels))], axis=1)
+
+    def _design(self, df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        spend = np.column_stack([df[ch].values.astype(float) for ch in self.channels])
+        controls = (self._raw_controls(df) - self._control_mean) / self._control_std
+        return self._spend_lags(spend), controls
 
     # ── Fitting ───────────────────────────────────────────────────────────────
 
     def fit(
         self,
         df: pd.DataFrame,
-        adstock_decays: dict | None = None,
-        hill_alphas: dict | None = None,
-        hill_gammas: dict | None = None,
+        draws: int = 1000,
+        tune: int = 1000,
+        chains: int = 4,
+        cores: int = 1,
+        target_accept: float = 0.9,
+        random_seed: int = 42,
+        progressbar: bool = True,
     ) -> "MarketingMixModel":
         """
-        Fit the MMM using optimised least squares.
+        Sample the posterior with NUTS.
 
         Args:
-            df: DataFrame with channel spend columns + target column
-            adstock_decays: Per-channel decay rates (default 0.5)
-            hill_alphas: Per-channel Hill alpha params (default 1.0)
-            hill_gammas: Per-channel Hill gamma (half-sat) params
+            df: DataFrame with channel spend columns, the target and any controls
+            draws, tune, chains: Sampler settings
+            cores: Chains run in parallel. The default of 1 runs them one after
+                another, which avoids multiprocessing problems on Windows.
+            target_accept: Raise towards 0.95–0.99 if the sampler reports divergences
+            random_seed: Seed for reproducible draws
 
         Returns:
             self (fitted model)
         """
-        adstock_decays = adstock_decays or {ch: 0.5 for ch in self.channels}
-        hill_alphas = hill_alphas or {ch: 1.0 for ch in self.channels}
-        hill_gammas = hill_gammas or {ch: df[ch].mean() for ch in self.channels}
+        try:
+            import pymc as pm
+            import pytensor.tensor as pt
+        except ImportError as error:
+            raise ImportError("fit() needs PyMC. Install it with: pip install pymc") from error
 
-        self.params = {
-            "adstock_decays": adstock_decays,
-            "hill_alphas": hill_alphas,
-            "hill_gammas": hill_gammas,
+        self._prepare(df)
+        x_lag, controls = self._design(df)
+        y = df[self.target].values.astype(float) / self._y_scale
+        coords = {"channel": self.channels}
+        if self.control_names_:
+            coords["control"] = self.control_names_
+        with pm.Model(coords=coords) as model:
+            lags = pt.as_tensor_variable(np.arange(self.max_lag, dtype=float))
+            spend_lags = pt.as_tensor_variable(x_lag)                        # (T, C, L)
+            decay = pm.Beta("decay", alpha=3.0, beta=3.0, dims="channel")
+            alpha = pm.Gamma("alpha", alpha=3.0, beta=3.0, dims="channel")
+            gamma = pm.Beta("gamma", alpha=2.0, beta=2.0, dims="channel")
+            beta = pm.HalfNormal("beta", sigma=0.5, dims="channel")
+            intercept = pm.Normal("intercept", mu=0.5, sigma=0.5)
+            sigma = pm.HalfNormal("sigma", sigma=0.2)
+
+            weights = decay[:, None] ** lags[None, :]                       # (C, L)
+            weights = weights / weights.sum(axis=1, keepdims=True)
+            adstocked = (spend_lags * weights[None, :, :]).sum(axis=2)       # (T, C)
+            saturated = pt.switch(
+                adstocked > 0,
+                pm.math.sigmoid(alpha * (pt.log(pt.maximum(adstocked, ADSTOCK_FLOOR)) - pt.log(gamma))),
+                0.0,
+            )
+            mu = intercept + (saturated * beta).sum(axis=1)
+            if self.control_names_:
+                control_coef = pm.Normal("control_coef", mu=0.0, sigma=0.5, dims="control")
+                mu = mu + pt.dot(pt.as_tensor_variable(controls), control_coef)
+
+            pm.Normal("y", mu=mu, sigma=sigma, observed=y)
+            idata = pm.sample(
+                draws=draws,
+                tune=tune,
+                chains=chains,
+                cores=cores,
+                target_accept=target_accept,
+                random_seed=random_seed,
+                progressbar=progressbar,
+            )
+
+        self.model_ = model
+        self.idata_ = idata
+
+        by_chain = {}
+        for name in POSTERIOR_KEYS:
+            if name == "control_coef" and not self.control_names_:
+                by_chain[name] = np.zeros((chains, draws, 0))
+            else:
+                by_chain[name] = np.asarray(idata.posterior[name].values, dtype=float)
+        posterior = {name: values.reshape((-1,) + values.shape[2:]) for name, values in by_chain.items()}
+
+        rhats = [gelman_rubin(values) for values in by_chain.values() if values.size]
+        self.diagnostics_ = {
+            "max_rhat": None if np.all(np.isnan(rhats)) else float(np.nanmax(rhats)),
+            "divergences": int(np.asarray(idata.sample_stats["diverging"].values).sum()),
+            "chains": chains,
+            "draws_per_chain": draws,
         }
+        return self._finalise(df, posterior)
 
-        X = self._build_features(df, adstock_decays, hill_alphas, hill_gammas)
-        y = df[self.target].values.astype(float)
+    def set_posterior(self, df: pd.DataFrame, posterior: dict) -> "MarketingMixModel":
+        """
+        Install posterior draws produced elsewhere (a saved fit, or a test fixture).
 
-        X_scaled = self.scaler.fit_transform(X)
-        y_mean, y_std = y.mean(), y.std()
-        y_norm = (y - y_mean) / y_std
+        `posterior` maps each name in POSTERIOR_KEYS to an array whose first axis is
+        the draw: intercept (S,), sigma (S,), beta/decay/alpha/gamma (S, n_channels),
+        control_coef (S, n_controls).
+        """
+        self._prepare(df)
+        posterior = {name: np.asarray(posterior[name], dtype=float) for name in POSTERIOR_KEYS}
+        n_draws = len(posterior["intercept"])
+        expected = {
+            "intercept": (n_draws,),
+            "sigma": (n_draws,),
+            "control_coef": (n_draws, len(self.control_names_)),
+            **{name: (n_draws, len(self.channels)) for name in ("beta", "decay", "alpha", "gamma")},
+        }
+        for name, shape in expected.items():
+            if posterior[name].shape != shape:
+                raise ValueError(f"posterior['{name}'] has shape {posterior[name].shape}, expected {shape}")
+        return self._finalise(df, posterior)
 
-        # Ordinary least squares via closed-form solution
-        X_aug = np.column_stack([np.ones(len(X_scaled)), X_scaled])
-        coeffs = np.linalg.lstsq(X_aug, y_norm, rcond=None)[0]
-
-        self.intercept_ = coeffs[0] * y_std + y_mean
-        self.coef_ = coeffs[1:] * y_std
-        self._y_std = y_std
-        self._y_mean = y_mean
+    def _finalise(self, df: pd.DataFrame, posterior: dict) -> "MarketingMixModel":
+        self.posterior_ = posterior
         self.is_fitted = True
-
-        # Store training scores
-        y_pred = X_aug @ coeffs * y_std + y_mean
+        y = df[self.target].values.astype(float)
+        y_pred = self.predict(df)
         self.train_r2_ = r2_score(y, y_pred)
         self.train_mape_ = mean_absolute_percentage_error(y, np.maximum(y_pred, 1))
-
         return self
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict revenue given media spend dataframe."""
+    # ── Posterior Computations ────────────────────────────────────────────────
+
+    def _thin(self, n_draws: int | None, seed: int = 0) -> dict:
+        """Random subset of the posterior draws (all of them when n_draws is None)."""
+        total = len(self.posterior_["intercept"])
+        if n_draws is None or n_draws >= total:
+            return self.posterior_
+        index = np.random.default_rng(seed).choice(total, size=n_draws, replace=False)
+        return {name: values[index] for name, values in self.posterior_.items()}
+
+    def _media_draws(self, x_lag: np.ndarray, posterior: dict) -> np.ndarray:
+        """Revenue from each channel, per draw and week: shape (S, T, C)."""
+        lags = np.arange(self.max_lag)
+        weights = posterior["decay"][:, :, None] ** lags                    # (S, C, L)
+        weights = weights / weights.sum(axis=2, keepdims=True)
+        adstocked = np.einsum("tcl,scl->stc", x_lag, weights)
+        saturated = expit(
+            posterior["alpha"][:, None, :]
+            * (np.log(np.maximum(adstocked, ADSTOCK_FLOOR)) - np.log(posterior["gamma"][:, None, :]))
+        )
+        saturated = np.where(adstocked > 0, saturated, 0.0)  # no spend, no effect
+        return saturated * posterior["beta"][:, None, :] * self._y_scale
+
+    def _baseline_draws(self, controls: np.ndarray, posterior: dict) -> np.ndarray:
+        """Revenue not attributed to media, per draw and week: shape (S, T)."""
+        baseline = posterior["intercept"][:, None] + posterior["control_coef"] @ controls.T
+        return baseline * self._y_scale
+
+    def predict(self, df: pd.DataFrame, return_draws: bool = False) -> np.ndarray:
+        """
+        Predict expected revenue for a spend dataframe.
+
+        Returns the posterior mean per week, or every posterior draw (S, T)
+        when return_draws is True.
+        """
         assert self.is_fitted, "Model must be fitted before predict()"
-        X = self._build_features(df, **self.params)
-        X_scaled = self.scaler.transform(X)
-        return X_scaled @ self.coef_ + self.intercept_
+        x_lag, controls = self._design(df)
+        draws = self._baseline_draws(controls, self.posterior_) + self._media_draws(x_lag, self.posterior_).sum(axis=2)
+        return draws if return_draws else draws.mean(axis=0)
+
+    def predict_interval(self, df: pd.DataFrame, prob: float = 0.9) -> pd.DataFrame:
+        """
+        Posterior mean and credible interval for expected weekly revenue.
+
+        The interval covers uncertainty in the model's parameters. It does not
+        include week-to-week noise, so actual revenue will fall outside it more often.
+        """
+        draws = self.predict(df, return_draws=True)
+        tail = (1 - prob) / 2
+        return pd.DataFrame(
+            {
+                "mean": draws.mean(axis=0),
+                "lower": np.quantile(draws, tail, axis=0),
+                "upper": np.quantile(draws, 1 - tail, axis=0),
+            }
+        )
 
     # ── Attribution ───────────────────────────────────────────────────────────
 
-    def channel_contribution(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _contribution_draws(self, df: pd.DataFrame) -> np.ndarray:
+        """Total revenue attributed to each channel over the period: shape (S, C)."""
+        assert self.is_fitted
+        x_lag, _ = self._design(df)
+        return self._media_draws(x_lag, self.posterior_).sum(axis=1)
+
+    def channel_contribution(self, df: pd.DataFrame, prob: float = 0.9) -> pd.DataFrame:
         """
-        Decompose predicted revenue into per-channel contributions.
+        Decompose revenue into per-channel contributions with credible intervals.
 
         Returns:
-            DataFrame with columns: channel, contribution, contribution_pct
+            DataFrame with columns: channel, contribution, contribution_lower,
+            contribution_upper, contribution_pct (share of all media-driven revenue)
         """
-        assert self.is_fitted
-        X = self._build_features(df, **self.params)
-        X_scaled = self.scaler.transform(X)
-
-        n_channels = len(self.channels)
-        channel_coefs = self.coef_[:n_channels]
-        channel_features = X_scaled[:, :n_channels]
-
-        contributions = channel_features * channel_coefs  # (T, C)
-        total_contrib = contributions.sum(axis=0)
-
+        draws = self._contribution_draws(df)
+        tail = (1 - prob) / 2
+        mean = draws.mean(axis=0)
         result = pd.DataFrame(
             {
                 "channel": self.channels,
-                "contribution": total_contrib,
-                "contribution_pct": total_contrib / total_contrib.sum() * 100,
+                "contribution": mean,
+                "contribution_lower": np.quantile(draws, tail, axis=0),
+                "contribution_upper": np.quantile(draws, 1 - tail, axis=0),
+                "contribution_pct": mean / mean.sum() * 100,
             }
-        ).sort_values("contribution_pct", ascending=False)
+        )
+        return result.sort_values("contribution_pct", ascending=False).reset_index(drop=True)
 
-        return result
+    def channel_roi(self, df: pd.DataFrame, prob: float = 0.9) -> pd.DataFrame:
+        """
+        Revenue returned per unit of spend, by channel, with credible intervals.
+
+        Returns:
+            DataFrame with columns: channel, spend, roi, roi_lower, roi_upper and
+            prob_roi_above_1 (posterior probability the channel returned more than it cost)
+        """
+        spend = np.array([float(df[ch].sum()) for ch in self.channels])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            draws = self._contribution_draws(df) / np.where(spend > 0, spend, np.nan)
+        tail = (1 - prob) / 2
+        result = pd.DataFrame(
+            {
+                "channel": self.channels,
+                "spend": spend,
+                "roi": draws.mean(axis=0),
+                "roi_lower": np.quantile(draws, tail, axis=0),
+                "roi_upper": np.quantile(draws, 1 - tail, axis=0),
+                "prob_roi_above_1": (draws > 1).mean(axis=0),
+            }
+        )
+        return result.sort_values("roi", ascending=False).reset_index(drop=True)
 
     # ── Budget Optimiser ──────────────────────────────────────────────────────
 
     def optimise_budget(
-        self, total_budget: float, df_baseline: pd.DataFrame, n_weeks: int = 52
+        self,
+        total_budget: float,
+        df_baseline: pd.DataFrame,
+        n_weeks: int = 52,
+        n_draws: int | None = 200,
+        min_share: float = 0.01,
+        max_share: float = 0.8,
+        prob: float = 0.9,
     ) -> dict:
         """
-        Find optimal media budget allocation to maximise predicted revenue.
+        Find the budget allocation that maximises posterior-mean revenue.
 
-        Uses scipy L-BFGS-B constrained optimisation.
+        The budget is spread evenly over the planning horizon. The optimiser
+        (SLSQP) works on each channel's share of the budget, bounded between
+        min_share and max_share.
 
         Args:
-            total_budget: Total annual media budget
-            df_baseline: Baseline dataframe (used to infer saturation params)
-            n_weeks: Planning horizon in weeks
+            total_budget: Total media budget for the horizon
+            df_baseline: Baseline dataframe; supplies the controls and the current channel mix
+            n_weeks: Planning horizon in weeks (capped at the length of df_baseline)
+            n_draws: Posterior draws used in the optimisation (None = all)
 
         Returns:
-            dict with optimal_allocation, expected_revenue, roi_by_channel
+            dict with optimal_allocation, expected_revenue and its credible interval,
+            roi_by_channel, the comparison with the current channel mix, and status
         """
         assert self.is_fitted
-        n = len(self.channels)
+        posterior = self._thin(n_draws)
+        horizon = df_baseline.iloc[:n_weeks].reset_index(drop=True)
+        n_periods = len(horizon)
+        _, controls = self._design(horizon)
+        baseline = self._baseline_draws(controls, posterior).sum(axis=1)            # (S,)
 
-        def negative_revenue(budgets):
-            """Objective: maximise revenue = minimise negative revenue."""
-            sim_df = df_baseline.copy().iloc[:n_weeks].reset_index(drop=True)
-            weekly = budgets / n_weeks
-            for i, ch in enumerate(self.channels):
-                sim_df[ch] = weekly[i]
-            return -self.predict(sim_df).sum()
+        def media_draws(shares: np.ndarray) -> np.ndarray:
+            weekly = np.tile(shares * total_budget / n_periods, (n_periods, 1))
+            return self._media_draws(self._spend_lags(weekly), posterior).sum(axis=1)  # (S, C)
 
-        # Initial allocation: proportional to historical spend
-        x0 = np.array([df_baseline[ch].sum() for ch in self.channels])
-        x0 = x0 / x0.sum() * total_budget
+        def objective(shares: np.ndarray) -> float:
+            return -media_draws(shares).sum(axis=1).mean() / (self._y_scale * n_periods)
 
-        # Constraints: sum = total_budget; each channel >= 1% of budget
-        constraints = {"type": "eq", "fun": lambda x: x.sum() - total_budget}
-        bounds = [(total_budget * 0.01, total_budget * 0.8) for _ in self.channels]
+        historical = np.array([float(df_baseline[ch].sum()) for ch in self.channels])
+        current_mix = historical / historical.sum() if historical.sum() > 0 else np.full(len(self.channels), 1 / len(self.channels))
+        start = np.clip(current_mix, min_share, max_share)
+        start = start / start.sum()
 
         result = minimize(
-            negative_revenue,
-            x0,
+            objective,
+            start,
             method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 500, "ftol": 1e-9},
+            bounds=[(min_share, max_share)] * len(self.channels),
+            constraints={"type": "eq", "fun": lambda shares: shares.sum() - 1.0},
+            options={"maxiter": 500, "ftol": 1e-10},
         )
+        shares = np.clip(result.x, min_share, max_share)
+        shares = shares / shares.sum()
+        if objective(shares) > objective(start):  # never return something worse than the starting mix
+            shares = start
 
-        optimal_budgets = result.x
-        optimal_revenue = -result.fun
+        budgets = shares * total_budget
+        optimal_media = media_draws(shares)
+        current_media = media_draws(current_mix)
+        revenue = baseline + optimal_media.sum(axis=1)
+        current_revenue = baseline + current_media.sum(axis=1)
+        tail = (1 - prob) / 2
 
         return {
-            "optimal_allocation": dict(zip(self.channels, optimal_budgets)),
-            "expected_revenue": optimal_revenue,
-            "status": result.message,
-            "roi_by_channel": {
-                ch: optimal_revenue * (b / total_budget) / b
-                for ch, b in zip(self.channels, optimal_budgets)
-            },
+            "optimal_allocation": dict(zip(self.channels, budgets.tolist())),
+            "expected_revenue": float(revenue.mean()),
+            "expected_revenue_interval": [float(np.quantile(revenue, tail)), float(np.quantile(revenue, 1 - tail))],
+            "roi_by_channel": dict(zip(self.channels, (optimal_media.mean(axis=0) / budgets).tolist())),
+            "current_mix_revenue": float(current_revenue.mean()),
+            "expected_uplift": float((revenue - current_revenue).mean()),
+            "prob_better_than_current_mix": float((revenue > current_revenue).mean()),
+            "status": str(result.message),
         }
 
     # ── Insight Extraction (LLM-Ready) ────────────────────────────────────────
 
-    def generate_insight_payload(
-        self, df: pd.DataFrame, total_budget: float
-    ) -> dict:
+    def generate_insight_payload(self, df: pd.DataFrame, total_budget: float) -> dict:
         """
-        Generate structured insight payload ready for LLM summarisation.
-
-        This dict can be passed directly to an LLM (e.g. Claude/GPT-4) to
-        produce natural language executive summaries for non-technical
-        stakeholders.
+        Generate a structured insight payload ready for LLM summarisation.
 
         Returns:
-            Structured dict with model performance, attribution, and optimisation
+            Structured dict with model performance, sampler diagnostics, attribution
+            and ROI with credible intervals, and the budget optimisation
         """
         contributions = self.channel_contribution(df)
+        roi = self.channel_roi(df)
         optimisation = self.optimise_budget(total_budget, df)
 
         return {
             "model_performance": {
-                "r2_score": round(self.train_r2_, 4),
-                "mape_pct": round(self.train_mape_ * 100, 2),
+                "r2_score": round(float(self.train_r2_), 4),
+                "mape_pct": round(float(self.train_mape_) * 100, 2),
             },
-            "channel_attribution": contributions.to_dict(orient="records"),
+            "sampler_diagnostics": self.diagnostics_,
+            "credible_interval_pct": 90,
+            "channel_attribution": to_records(contributions.round(2)),
+            "channel_roi": to_records(roi.round(3)),
             "budget_optimisation": {
                 "total_budget": total_budget,
-                "optimal_allocation": optimisation["optimal_allocation"],
+                "optimal_allocation": {k: round(v, 2) for k, v in optimisation["optimal_allocation"].items()},
                 "expected_revenue": round(optimisation["expected_revenue"], 2),
-                "roi_by_channel": {
-                    k: round(v, 3)
-                    for k, v in optimisation["roi_by_channel"].items()
-                },
+                "expected_revenue_interval": [round(v, 2) for v in optimisation["expected_revenue_interval"]],
+                "roi_by_channel": {k: round(v, 3) for k, v in optimisation["roi_by_channel"].items()},
+                "expected_uplift_vs_current_mix": round(optimisation["expected_uplift"], 2),
+                "prob_better_than_current_mix": round(optimisation["prob_better_than_current_mix"], 3),
             },
             "top_channel": contributions.iloc[0]["channel"],
-            "lowest_roi_channel": min(
-                optimisation["roi_by_channel"],
-                key=optimisation["roi_by_channel"].get,
-            ),
+            "lowest_roi_channel": roi.dropna(subset=["roi"]).iloc[-1]["channel"],
         }

@@ -24,6 +24,8 @@ def build_insight_prompt(payload: dict) -> str:
 
 Below is the output from a Marketing Mix Model analysis. Translate this into clear, 
 actionable insights for a non-technical CMO. Be specific about numbers. Highlight risks.
+The model is Bayesian: lower/upper values are 90% credible intervals. Say so plainly when an
+interval is wide or a channel's probability of returning more than it cost is low.
 
 MODEL OUTPUT:
 {json.dumps(payload, indent=2)}
